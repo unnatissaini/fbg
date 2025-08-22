@@ -1,0 +1,480 @@
+//15/07/2024
+      int const iDATALEN = 4;                 // average reading is 4 bytes (after making nibbles)
+      int const iCHANELS = 4;                 // Six chanels
+      int const iReadThresoldCom = iDATALEN * iCHANELS + 2;    // +2 for [ & ] chars
+      char const cStopCom = 'S';              //Stop command
+      char const cAcqCom  = 'G';              //Acquire command
+      char const cLinkCom = 'L';              //Link command, acquire at 10 Hz
+      char bComChar;                    //Command Char
+      boolean bIsLinked = false;        //Indicates linked status
+      boolean bIsInAcqMode = false;     //Indicates acqusition mode
+      String strData;
+      unsigned long const lKillTime = 100;    //General delay in ms, wantssampling at 10 Hzs
+      const int iBaudRate = 38400;            //To ensure data safety operate at optimum speed
+      int iReadStatus;
+      //const int iComLength = 13;               //Change this if size of command changes
+      int tcount=0;
+      const byte interruptPin = 4;
+// delay setting----------------------
+byte DelayByt1=0x00;// max at 185//1F                     //Hold Delay Byte high
+byte DelayByt2=0x00;// max at 385 //47                      //Hold Delay Byte high
+byte DelayByt3=0x00;      //6F                 //Hold Delay Byte high
+byte DelayByt4=0x00;       //97                //Hold Delay Byte high
+//------------------------------------
+int  iChNo=0;
+int  iCountNo=0;
+int  PrintData;
+//short iaDelayData[48];                //Storing incoming delay Data on 29-03-2024
+int AvgBy = 20;
+int ChA=0;
+int ChB=0;
+int ChC=0;
+int ChD=0;
+int AvgChA=0;
+int AVgChB=0;
+int AvgChC=0;
+int AvgChD=0;
+//---------------------------------Pin Defination
+const int EN1 = 25;
+const int PinG = 9;
+const int SEROP = 14;
+int value[256];     // Simulated signal values
+int peaks[256];      
+int peakCount = 0;
+// ---- NEW: calibration config ----
+#define SIG_LEN   256
+#define NUM_RUNS  8
+int peaksAll[NUM_RUNS][4];  // store peaks for each of the 8 signals
+int avgPeaks[4];             // store average of the 4 peaks across 8 signals
+uint16_t avgPeaksHex[4];
+// ---- NEW: calibration storage & state ----
+volatile uint16_t signalData[NUM_RUNS][SIG_LEN]; // 8 signals × 256 samples
+volatile uint8_t  gSigNo = 0;                    // which signal [0..7]
+volatile uint16_t gSampleIdx = 0;                // sample index [0..255]
+volatile bool     gCalibBlockDone = false;       // set true when 8×256 captured
+volatile bool     gCalibrationDone = false;      // set true after peaks detected
+
+// ---- NEW: averaged waveform (int so math is comfy) ----
+int avgSignal[SIG_LEN];
+
+
+void setChHwAddress(int iChNo)
+{
+    PIOC->PIO_ODSR = 0x03FE; // Write something on pins 33-40
+    }
+//-----------------
+void setDelayByteL(int iDelayL)
+{
+    PIOC->PIO_ODSR = iDelayL & 0x03FE; // Write delay ByleL something on pins 33-40
+    }
+//---------------------
+void setDelayByteH(int iDelayH)
+{
+    PIOC->PIO_ODSR = iDelayH & 0x03FE; // Write delay ByleH something on pins 33-40
+   }
+//for scanning-------------
+void detectPeaksOn(const volatile uint16_t* data, int len, int* outPeaks, int* outCount, int threshold, int runNo) {
+    int count = 0;
+    int i = 1;
+
+    Serial.print("Run ");
+    Serial.println(runNo);
+
+    while (i < len - 1 && count < 4) {
+        if (data[i] >= threshold) {
+            int peakIndex = i;
+            int peakValue = data[i];
+
+            // Find the local maximum
+            while (i < len - 1 && data[i] >= threshold) {
+                if (data[i] > peakValue) {
+                    peakValue = data[i];
+                    peakIndex = i;
+                }
+                i++;
+            }
+
+            // Store the peak
+            outPeaks[count++] = peakIndex;
+
+            // Print the peak info
+            Serial.print("  Peak ");
+            Serial.print(count - 1);
+            Serial.print(": Index = ");
+            Serial.print(peakIndex);
+            Serial.print(", Value = ");
+            Serial.println(peakValue);
+
+            // Skip a small window to avoid duplicate peaks
+            i = peakIndex + 10;
+        } else {
+            i++;
+        }
+    }
+
+    // Fill remaining peaks with -1
+    for (int j = count; j < 4; j++) {
+        outPeaks[j] = -1;
+    }
+
+    *outCount = count;
+}
+
+
+void computeAvgPeaks() {
+    for (int peakNo = 0; peakNo < 4; peakNo++) {
+        long sum = 0;
+        int validCount = 0;
+
+        for (int run = 0; run < NUM_RUNS; run++) {
+            if (peaksAll[run][peakNo] != -1) {   // only include valid peaks
+                sum += peaksAll[run][peakNo];
+                validCount++;
+            }
+        }
+
+        if (validCount > 0)
+            avgPeaks[peakNo] = sum / validCount;  // average of valid peaks
+        else
+            avgPeaks[peakNo] = -1;                // no peaks detected at all
+    }
+}
+
+
+
+
+void calibISR() {
+    applyPreReadDelay(0);
+    uint16_t v = analogRead(4);             // read analog sample
+    signalData[gSigNo][gSampleIdx++] = v;   // store in array
+
+    if (gSampleIdx >= SIG_LEN) {  // one signal captured
+        gSampleIdx = 0;
+        gSigNo++;
+
+        if (gSigNo >= NUM_RUNS) { // all 8 signals captured
+            gSigNo = 0;
+            gCalibBlockDone = true;
+            detachInterrupt(digitalPinToInterrupt(interruptPin));
+        }
+    }
+}
+
+
+void detectPeaksForRun(volatile uint16_t* signal, int len, int runNo) {
+     int count = 0;
+     
+    detectPeaksOn(signal, SIG_LEN, peaksAll[runNo], &count, 100, runNo); // threshold = 20
+    // ensure we have 4 peaks
+    for (int i = count; i < 4; i++)
+    {
+        peaksAll[runNo][i] = -1;   // mark as no peak
+     }
+}
+void finalizeCalibration() {
+    // Step 1: Detect peaks for all 8 signals
+    for (int run = 0; run < NUM_RUNS; run++) {
+        int count;
+        detectPeaksOn(signalData[run], SIG_LEN, peaksAll[run], &count, 100, run); // set correct threshold
+        // Ensure 4 peaks per run
+        for (int i = count; i < 4; i++)
+            peaksAll[run][i] = (count > 0) ? peaksAll[run][count-1] : 0;
+    }
+
+    // Step 2: Compute average index for each peak
+    computeAvgPeaks();
+
+    // Step 3: Apply average peak delays
+    convertAvgPeaksToHex();
+    printAvgPeaksHex();    
+    applyAvgPeakDelays();
+
+    // Step 4: Switch to runtime ISR
+    attachInterrupt(digitalPinToInterrupt(interruptPin), blink, RISING);
+    gCalibrationDone = true;
+}
+// Convert decimal avgPeaks[] to numeric "hex" storage in avgPeaksHex[]
+void convertAvgPeaksToHex() {
+    for (int i = 0; i < 4; i++) {
+        if (avgPeaks[i] == -1) {
+            avgPeaksHex[i] = 0;   // mark no peak found
+        } else {
+            avgPeaksHex[i] = avgPeaks[i];  // store numeric value; printing in HEX is optional
+        }
+    }
+}
+
+void printAvgPeaksHex() {
+    for (int i = 0; i < 4; i++) {
+        if (avgPeaks[i] == -1) continue;
+        Serial.print("Peak ");
+        Serial.print(i);
+        Serial.print(" avg index: 0x");
+        Serial.println(avgPeaksHex[i], HEX);
+    }
+}
+void applyPreReadDelay(int chIndex) {
+    // Use default values, not avgPeaksHex
+    byte preReadDelay[4] = {DelayByt1, DelayByt2, DelayByt3, DelayByt4};
+    if (chIndex < 0 || chIndex > 3) return; // safety
+    PIOC->PIO_ODSR = preReadDelay[chIndex] * 2;
+    delayMicroseconds(5); // hardware latch time
+}
+
+void applyAvgPeakDelays() {
+  for (int i = 0; i < 4; i++) {
+      if (avgPeaks[i] == -1) continue;        // skip invalid peaks
+      PIOC->PIO_ODSR = avgPeaksHex[i] * 2;   // apply delay
+      delayMicroseconds(5);                   // hardware latch time
+  }
+}
+
+
+
+//--------------------------------
+
+String getCommandResponse(char cUseComChar)
+  {
+      String strResponse = "[";
+      for (int i = 0; i < (iReadThresoldCom - 2); i++)
+       strResponse += cUseComChar;
+
+      strResponse += "]";
+      return strResponse;
+  }
+//----------------------------------
+String FormatDataToFixLen(int iNumber)
+{   int i, j;
+    String strRet;
+      strRet = String(iNumber);
+      j = iDATALEN - strRet.length();
+      for (i = 0; i < j; i++)
+       {
+        strRet = "0" + strRet;
+       }
+      return strRet;
+}        
+//---------------------------
+void TC3_Handler()
+{
+    TC_GetStatus(TC1, 0);
+    tcount++;
+    if(bIsInAcqMode)//((D)>53 & (E)>348)
+    {
+    String strData = "[" + FormatDataToFixLen(AvgChA) + FormatDataToFixLen(AVgChB) + FormatDataToFixLen(AvgChC) + FormatDataToFixLen(AvgChD) + "]";
+    //String strData =  FormatDataToFixLen(E) + "," + FormatDataToFixLen(F) + "," + FormatDataToFixLen(H) + "," + FormatDataToFixLen(I);
+    Serial.println(strData);
+    }
+    tcount++;
+
+    if(tcount == 1) 
+    {
+      //A=0;
+      //B=0;
+      ChD=0;
+      AvgChA = 0;
+      tcount = 0;
+    }
+    //A=0;
+    //B=0;
+    ChD = 0;
+    AvgChA = 0;
+}
+void startTimer(Tc *tc, uint32_t channel, IRQn_Type irq, uint32_t frequency) 
+{
+    pmc_set_writeprotect(false);
+    pmc_enable_periph_clk((uint32_t)irq);
+    TC_Configure(tc, channel, TC_CMR_WAVE | TC_CMR_WAVSEL_UP_RC | TC_CMR_TCCLKS_TIMER_CLOCK4);
+    uint32_t rc = VARIANT_MCK/128/frequency; //128 because we selected TIMER_CLOCK4 above
+    TC_SetRA(tc, channel, rc/2); //50% high, 50% low
+    TC_SetRC(tc, channel, rc);
+    TC_Start(tc, channel);
+    tc->TC_CHANNEL[channel].TC_IER=TC_IER_CPCS;
+    tc->TC_CHANNEL[channel].TC_IDR=~TC_IER_CPCS;
+    NVIC_EnableIRQ(irq);
+}
+
+void setup()
+{
+    // put your setup code here, to run once:
+    Serial.begin(iBaudRate);
+    delay(10);
+
+    PIOC->PIO_PER = 0x01FE; // Configure PORTC to PIO controller, pins 33-40 C8-C1
+    PIOC->PIO_OER = 0x01FE; // Enable PORTC to output
+
+    PIOD->PIO_PER = 0x01FF; // Configure PORTD to PIO controller, pins 33-40
+    PIOD->PIO_OER = 0xFFFF; // Enable PORTC to output
+
+    //PIOC->PIO_ODSR = 0x0100; // Write something on pins 33-40
+    //PIOD->PIO_ODSR = 0x00;
+
+    //All strobes in OUTPUT mode
+    pinMode(EN1, OUTPUT);
+    pinMode(PinG, OUTPUT);
+    pinMode(SEROP,OUTPUT);
+    analogReadResolution(12);
+    pinMode(interruptPin, INPUT_PULLUP);
+    PIOC->PIO_ODSR = ((DelayByt1)* 2) ;
+          
+    digitalWrite(EN1, HIGH);
+    digitalWrite(EN1, LOW);
+
+    // In setup(), REPLACE your attachInterrupt(..., blink, RISING) with:
+    attachInterrupt(digitalPinToInterrupt(interruptPin), calibISR, RISING);
+
+  startTimer(TC1, 0, TC3_IRQn, 100);// to initilize timer
+}
+//All serial responses are sent to PC by this subroutine, you need to change here only
+void GetCommand()
+{
+    if (Serial.available() > 0) //Check for valid command
+    {  
+      iReadStatus = Serial.readBytes(&bComChar, 1);    // read the incoming Char
+      Serial.flush();                                  
+        
+      switch (bComChar) 
+      { 
+      case cLinkCom : 
+      delay(lKillTime);
+      Serial.println(getCommandResponse(cLinkCom)); 
+      bIsLinked = true;
+      bIsInAcqMode = false;
+      break;
+
+      case cAcqCom :
+      Serial.println(getCommandResponse(cAcqCom)); 
+      bIsInAcqMode = true;
+      delay(lKillTime);
+      break;
+
+      case cStopCom :
+      Serial.println(getCommandResponse(cStopCom)); 
+      bIsInAcqMode = false;
+      delay(lKillTime);
+      break;
+    }      //end of switch
+  }
+}
+
+void loop()
+{
+  GetCommand();
+  // In loop(), ADD:
+  if (!gCalibrationDone && gCalibBlockDone) {
+    finalizeCalibration();
+    gCalibBlockDone = false; // not strictly needed once detached
+  }
+  
+  }
+
+
+void blink() 
+{
+    iChNo++;
+    iCountNo++;
+        
+        if (iChNo == 1) 
+        {
+          delayMicroseconds(6);
+          ChA+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChA+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChA+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChA+=analogRead(4);
+          
+          delayMicroseconds(6);
+          digitalWrite(PinG, HIGH);
+          delayMicroseconds(20);
+          digitalWrite(PinG, LOW);
+          PIOC->PIO_ODSR = ((avgPeaksHex[1])* 2) ;
+          
+          digitalWrite(EN1, HIGH);
+          digitalWrite(EN1, LOW);
+          if(iCountNo==17)//37
+          {
+            AvgChA=ChA/20;
+            ChA=0;
+          }
+        }
+        
+        if (iChNo==2) 
+        {
+          delayMicroseconds(6);
+          ChB+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChB+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChB+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChB+=analogRead(4);
+          
+          delayMicroseconds(6);
+          digitalWrite(PinG, HIGH);
+          delayMicroseconds(20);
+          digitalWrite(PinG, LOW);
+          PIOC->PIO_ODSR = ((avgPeaksHex[2])* 2);
+          digitalWrite(EN1, HIGH);
+          digitalWrite(EN1, LOW);
+          if(iCountNo==18)//38
+          {
+            AVgChB=ChB/20;//40
+            ChB=0;
+          }
+        }
+
+       if (iChNo==3) 
+       {
+          delayMicroseconds(6);
+          ChC+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChC+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChC+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChC+=analogRead(4);
+          
+          delayMicroseconds(6);
+          digitalWrite(PinG, HIGH);
+          delayMicroseconds(20);
+          digitalWrite(PinG, LOW);
+          PIOC->PIO_ODSR = ((avgPeaksHex[3])* 2) ;
+          
+          digitalWrite(EN1, HIGH);
+          digitalWrite(EN1, LOW);
+          if(iCountNo==19)//39
+          {
+            AvgChC=ChC/20;
+            ChC=0;
+          }
+        }
+        
+        if (iChNo==4) 
+        {
+          delayMicroseconds(6);
+          ChD+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChD+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChD+=analogRead(4);
+          delayMicroseconds(0.5);
+          ChD+=analogRead(4);
+          
+          delayMicroseconds(6);
+          digitalWrite(PinG, HIGH);
+          delayMicroseconds(20);
+          digitalWrite(PinG, LOW);
+          PIOC->PIO_ODSR = ((avgPeaksHex[0])* 2);
+          digitalWrite(EN1, HIGH);
+          digitalWrite(EN1, LOW);
+          if(iCountNo==20)//40
+          {
+            AvgChD=ChD/20;
+            iCountNo=0;
+            ChD=0;
+          }
+        iChNo=0;
+        }
+}
