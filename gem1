@@ -1,0 +1,308 @@
+/*
+ * This program reads analog data at a high frequency triggered by an external
+ * interrupt and stores it in a buffer. The main loop then processes this
+ * data to find and display local maxima (peaks).
+ *
+ * The core logic relies on:
+ * - A fast Interrupt Service Routine (ISR) to handle time-critical data sampling.
+ * - A main loop to perform slower, non-critical tasks like pin control,
+ * data analysis (peak finding), and serial communication.
+ * - A volatile flag to communicate between the ISR and the main loop.
+ */
+
+// --- Communication & Control Constants ---
+int const iDATALEN = 4;
+int const iCHANELS = 4;
+int const iReadThresoldCom = iDATALEN * iCHANELS + 2;
+char const cStopCom = 'S';
+char const cAcqCom = 'G';
+char const cLinkCom = 'L';
+char bComChar;
+boolean bIsLinked = false;
+boolean bIsInAcqMode = false;
+unsigned long const lKillTime = 100;
+const int iBaudRate = 74880;
+int iReadStatus;
+int tcount = 0;
+int ChA = 0, ChB = 0, ChC = 0, ChD = 0;
+int AvgChA = 0, AvgChB = 0, AvgChC = 0, AvgChD = 0;
+volatile bool shouldPrint = false; // Flag to indicate whether data should be printed
+volatile int dataToPrint[4] = {0};
+// --- Pin Definitions ---
+const int EN1 = 25;
+const int PinG = 9;
+const int SEROP = 14;
+const byte interruptPin = 4;
+
+// --- Delay Setting (Values to be written to PIOC) ---
+byte DelayByt1 = 0x38;
+byte DelayByt2 = 0x6D;
+byte DelayByt3 = 0xA7;
+byte DelayByt4 = 0xE3;
+
+// --- Data Buffers and Flags (volatile for ISR access) ---
+const int MAX_COUNT = 256;
+volatile uint16_t i = 0;
+volatile int signalBuffer[MAX_COUNT];
+volatile bool sampleRequest = false;
+volatile uint16_t lastSampleIndex = 0;
+volatile bool fullWaveReady = false;
+
+// --- Peak Storage ---
+int peakIndices[MAX_COUNT];
+int peakValues[MAX_COUNT];
+int peakCount = 0;
+
+
+// --- Function Prototypes ---
+void setChHwAddress(int iChNo);
+void setDelayByteL(int iDelayL);
+void setDelayByteH(int iDelayH);
+String getCommandResponse(char cUseComChar);
+String FormatDataToFixLen(int iNumber);
+void startTimer(Tc *tc, uint32_t channel, IRQn_Type irq, uint32_t frequency);
+void GetCommand();
+void blink();
+void findPeaks(const int data[MAX_COUNT]);
+void displayPeaks();
+
+
+// --- Setup Function ---
+void setup() {
+    Serial.begin(iBaudRate);
+    delay(10);
+
+    // Pin configuration
+    PIOC->PIO_PER = 0x01FE; // Configure PORTC for PIO control
+    PIOC->PIO_OER = 0x01FE; // Set PORTC pins as outputs
+    PIOD->PIO_PER = 0x01FF; // Configure PORTD for PIO control
+    PIOD->PIO_OER = 0xFFFF; // Set PORTD pins as outputs
+    pinMode(EN1, OUTPUT);
+    pinMode(PinG, OUTPUT);
+    pinMode(SEROP, OUTPUT);
+    analogReadResolution(12);
+    pinMode(interruptPin, INPUT_PULLUP);
+    
+    // Initial pin state and interrupt setup
+    PIOC->PIO_ODSR = ((DelayByt1) * 2);
+    digitalWrite(EN1, HIGH);
+    digitalWrite(EN1, LOW);
+    attachInterrupt(digitalPinToInterrupt(interruptPin), blink, RISING);
+    startTimer(TC1, 0, TC3_IRQn, 100);
+}
+
+
+// --- Main Program Loop ---
+void loop() {
+    GetCommand();
+
+    // Handle pending sample requests from the ISR
+    if (sampleRequest) {
+        // Make a local copy of the index to work with
+        noInterrupts();
+        uint16_t idx = lastSampleIndex;
+        sampleRequest = false;
+        interrupts();
+
+        // Perform the analog read and store it in the buffer
+        int val = analogRead(4);
+        signalBuffer[idx] = val;
+
+        // Perform pin manipulations outside the ISR
+        digitalWrite(PinG, HIGH);
+        delayMicroseconds(5);
+        digitalWrite(PinG, LOW);
+        
+        PIOC->PIO_ODSR = ((uint32_t)idx * 2);
+        
+        digitalWrite(EN1, HIGH);
+        delayMicroseconds(5);
+        digitalWrite(EN1, LOW);
+    }
+    
+    // Process a full wave when it is ready
+    if (fullWaveReady) {
+        int localSignal[MAX_COUNT];
+        
+        // Atomically copy the volatile buffer to a local, stable array
+        noInterrupts();
+        for (int k = 0; k < MAX_COUNT; ++k) localSignal[k] = signalBuffer[k];
+        fullWaveReady = false;
+        interrupts();
+
+        // Analyze the local copy for peaks and then display them
+        findPeaks(localSignal);
+        displayPeaks();
+    }
+}
+
+
+// --- Interrupt Service Routine ---
+void blink() {
+    // Set the flag for the main loop to process the sample
+    lastSampleIndex = i;
+    sampleRequest = true;
+
+    // Increment index and check for wrap-around
+    if (++i >= MAX_COUNT) {
+        i = 0;
+        fullWaveReady = true;
+    }
+}
+
+
+// --- Peak Finding Function (Modified) ---
+void findPeaks(const int data[MAX_COUNT]) {
+    peakCount = 0;
+    const int THRESHOLD = 300;
+    const int WINDOW_SIZE = 12;
+    const int SKIP_COUNT = 25;
+    
+    for (int k = 1; k < MAX_COUNT - 1; ++k) {
+        // Find a potential peak (local maximum above the threshold)
+        if (data[k] > data[k - 1] && data[k] > data[k + 1] && data[k] > THRESHOLD) {
+            
+            // Assume this is the true peak until a higher one is found
+            bool isTruePeak = true;
+            int maxInWindow = data[k];      //redefining the window element
+            int maxIndexInWindow = k;
+
+            int cnt_abv=0;
+            for (int j = k + 1; j <= k + WINDOW_SIZE && j < MAX_COUNT; ++j) {
+             
+                if ( data[j++]>=THRESHOLD ) {   //--------------------------check abv threshold
+                   cnt_abv++;
+                }
+            }
+            // Check the next 10 indices for a higher peak
+            for (int j = k + 1; j <= k + WINDOW_SIZE && j < MAX_COUNT; ++j) {
+             
+                if (data[j] > maxInWindow && cnt_abv>=11 ) {   //--------------------------check not 0
+                    maxInWindow = data[j];
+                    maxIndexInWindow = j;
+                    isTruePeak = false; // A higher value was found
+                }
+            }
+
+            // If the original point is the highest in the window, it's a true peak
+            if (isTruePeak) {
+                peakIndices[peakCount] = k;
+                peakValues[peakCount] = data[k];
+                peakCount++;
+                
+                // Skip the next 15 indices to avoid close peaks
+                k += SKIP_COUNT;
+            } else {
+                // If a higher peak was found later, skip to that new peak's location and re-evaluate
+                k = maxIndexInWindow - 1;
+            }
+        }
+    }
+}
+
+
+// --- New Function to Display Peak Data ---
+void displayPeaks() {
+    Serial.println("\n--- Peak Analysis Results ---");
+    Serial.print("Total Peaks Found: ");
+    Serial.println(peakCount);
+    
+    if (peakCount > 0) {
+        Serial.println("-----------------------------");
+        Serial.println("Index\tValue");
+        Serial.println("-----------------------------");
+        for (int j = 0; j < peakCount; j++) {
+            Serial.print(peakIndices[j]);
+            Serial.print("\t");
+            Serial.println(peakValues[j]);
+        }
+        Serial.println("-----------------------------");
+    }
+}
+
+
+// --- All Other Functions (your original) ---
+void setChHwAddress(int iChNo) {
+    PIOC->PIO_ODSR = 0x03FE;
+}
+
+void setDelayByteL(int iDelayL) {
+    PIOC->PIO_ODSR = iDelayL & 0x03FE;
+}
+
+void setDelayByteH(int iDelayH) {
+    PIOC->PIO_ODSR = iDelayH & 0x03FE;
+}
+
+String getCommandResponse(char cUseComChar) {
+    String strResponse = "[";
+    for (int k = 0; k < (iReadThresoldCom - 2); k++)
+        strResponse += cUseComChar;
+    strResponse += "]";
+    return strResponse;
+}
+
+String FormatDataToFixLen(int iNumber) {
+    String strRet = String(iNumber);
+    int j = iDATALEN - strRet.length();
+    for (int k = 0; k < j; k++) {
+        strRet = "0" + strRet;
+    }
+    return strRet;
+}
+
+void TC3_Handler() {
+    TC_GetStatus(TC1, 0);
+    tcount++;
+    if (bIsInAcqMode) {
+        dataToPrint[0] = AvgChA;
+        dataToPrint[1] = AvgChB;
+        dataToPrint[2] = AvgChC;
+        dataToPrint[3] = AvgChD;
+        shouldPrint = true;
+    }
+    tcount++;
+    if (tcount == 1) {
+        ChD = 0;
+        AvgChA = 0;
+        tcount = 0;
+    }
+}
+
+void startTimer(Tc *tc, uint32_t channel, IRQn_Type irq, uint32_t frequency) {
+    pmc_set_writeprotect(false);
+    pmc_enable_periph_clk((uint32_t)irq);
+    TC_Configure(tc, channel, TC_CMR_WAVE | TC_CMR_WAVSEL_UP_RC | TC_CMR_TCCLKS_TIMER_CLOCK4);
+    uint32_t rc = VARIANT_MCK / 128 / frequency;
+    TC_SetRA(tc, channel, rc / 2);
+    TC_SetRC(tc, channel, rc);
+    TC_Start(tc, channel);
+    tc->TC_CHANNEL[channel].TC_IER = TC_IER_CPCS;
+    tc->TC_CHANNEL[channel].TC_IDR = ~TC_IER_CPCS;
+    NVIC_EnableIRQ(irq);
+}
+
+void GetCommand() {
+    if (Serial.available() > 0) {
+        iReadStatus = Serial.readBytes(&bComChar, 1);
+        Serial.flush();
+        switch (bComChar) {
+            case cLinkCom:
+                delay(lKillTime);
+                Serial.println(getCommandResponse(cLinkCom));
+                bIsLinked = true;
+                bIsInAcqMode = false;
+                break;
+            case cAcqCom:
+                Serial.println(getCommandResponse(cAcqCom));
+                bIsInAcqMode = true;
+                delay(lKillTime);
+                break;
+            case cStopCom:
+                Serial.println(getCommandResponse(cStopCom));
+                bIsInAcqMode = false;
+                delay(lKillTime);
+                break;
+        }
+    }
+}
