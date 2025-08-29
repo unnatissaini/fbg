@@ -1,0 +1,451 @@
+// --- Communication & Control Constants ---
+int const iDATALEN = 4;
+int const iCHANELS = 4;
+int const iReadThresoldCom = iDATALEN * iCHANELS + 2;
+char const cStopCom = 'S';
+char const cAcqCom = 'G';
+char const cLinkCom = 'L';
+char bComChar;
+boolean bIsLinked = false;
+boolean bIsInAcqMode = false;
+unsigned long const lKillTime = 100;
+const int iBaudRate = 74880;
+int iReadStatus;
+
+// Your original variables, now with global scope and volatile for ISR access
+volatile int Ch[4] = {0, 0, 0, 0};
+int AvgCh[4] = {0, 0, 0, 0};
+volatile bool shouldPrint = false;
+volatile int dataToPrint[4] = {0};
+volatile int iChNo = 0;
+volatile int iCountNo = 0;
+int tcount =0;
+// --- Pin Definitions ---
+const int EN1 = 25;
+const int PinG = 9;
+const int SEROP = 14;
+const byte interruptPin = 4;
+
+// --- Delay Setting (Values to be written to PIOC) ---
+byte DelayByt1 = 0x38;
+byte DelayByt2 = 0x6D;
+byte DelayByt3 = 0xA7;
+byte DelayByt4 = 0xE3;
+
+// --- Data Buffers and Flags (volatile for ISR access) ---
+const int MAX_COUNT = 256;
+volatile uint16_t i = 0;
+volatile int signalBuffer[MAX_COUNT];
+volatile bool sampleRequest = false;
+volatile uint16_t lastSampleIndex = 0;
+volatile bool fullWaveReady = false;
+
+// --- Calibration Phase Variables ---
+const int NUM_CALIB_WAVES = 8;
+volatile int waveCounter = 0;
+volatile bool calibrationComplete = false;
+volatile int calibPeakIndices[NUM_CALIB_WAVES][MAX_COUNT];
+volatile int avgCalibPeaks[4] = {0, 0, 0, 0}; // To store the final averaged peak indices
+volatile int finalPeakCount = 0;
+// --- Peak Storage ---
+int peakIndices[MAX_COUNT];
+int peakValues[MAX_COUNT];
+int peakCount = 0;
+
+volatile int acquiredData[MAX_COUNT];
+volatile int acquiredCount = 0;
+//volatile bool shouldPrint = false;
+volatile int currentPeakIndex = 0;
+// --- Function Prototypes ---
+void setChHwAddress(int iChNo);
+void setDelayByteL(int iDelayL);
+void setDelayByteH(int iDelayH);
+String getCommandResponse(char cUseComChar);
+String FormatDataToFixLen(int iNumber);
+void startTimer(Tc *tc, uint32_t channel, IRQn_Type irq, uint32_t frequency);
+void GetCommand();
+void calibISR();
+void findPeaks(const int data[MAX_COUNT]);
+void displayPeaks();
+void finalizeCalibrationWave();
+void applyAvgPeakDelays();
+void blink();
+
+// --- Setup Function ---
+
+void setChHwAddress(int iChNo)
+{
+    PIOC->PIO_ODSR = 0x03FE; // Write something on pins 33-40
+    //PIOD->PIO_ODSR = iChNo & 0x3F;   //ANDING ensures only proper bits are affected
+
+    //  digitalWrite(iAddStrobe, LOW);
+    //  digitalWrite(iAddStrobe, HIGH);     //Generates a strobe
+    //  digitalWrite(iAddStrobe, LOW);
+}
+//-----------------
+void setDelayByteL(int iDelayL)
+{
+    PIOC->PIO_ODSR = iDelayL & 0x03FE; // Write delay ByleL something on pins 33-40
+    //  digitalWrite(iDataStrobeL, LOW);
+    //  digitalWrite(iDataStrobeL, HIGH);     //Generates a strobe
+    //  digitalWrite(iDataStrobeL, LOW);
+    //Set flag for Lower byte
+}
+//---------------------
+void setDelayByteH(int iDelayH)
+{
+    PIOC->PIO_ODSR = iDelayH & 0x03FE; // Write delay ByleH something on pins 33-40
+    //  digitalWrite(iDataStrobeH, LOW);
+    //  digitalWrite(iDataStrobeH, HIGH);     //Generates a strobe
+    //  digitalWrite(iDataStrobeH, LOW);
+    //Set flag for Higher byte
+}
+String getCommandResponse(char cUseComChar)
+  {
+      String strResponse = "[";
+      for (int i = 0; i < (iReadThresoldCom - 2); i++)
+       strResponse += cUseComChar;
+
+      strResponse += "]";
+      return strResponse;
+  }
+//----------------------------------
+String FormatDataToFixLen(int iNumber)
+{   int i, j;
+    String strRet;
+      strRet = String(iNumber);
+      j = iDATALEN - strRet.length();
+      for (i = 0; i < j; i++)
+       {
+        strRet = "0" + strRet;
+       }
+      return strRet;
+}        
+void TC3_Handler()
+{
+    TC_GetStatus(TC1, 0);
+    tcount++;
+    if(bIsInAcqMode)
+    {
+        String strData = "[";
+        for (int i = 0; i < finalPeakCount; i++) {
+            strData += FormatDataToFixLen(AvgCh[i]);
+        }
+        strData += "]";
+        Serial.println(strData);
+    }
+    tcount++;
+
+    if(tcount == 1)
+    {
+        // Resetting all accumulated average values
+        for (int i = 0; i < finalPeakCount; i++) {
+            AvgCh[i] = 0;
+        }
+        tcount = 0;
+    }
+}
+void startTimer(Tc *tc, uint32_t channel, IRQn_Type irq, uint32_t frequency) 
+{
+    pmc_set_writeprotect(false);
+    pmc_enable_periph_clk((uint32_t)irq);
+    TC_Configure(tc, channel, TC_CMR_WAVE | TC_CMR_WAVSEL_UP_RC | TC_CMR_TCCLKS_TIMER_CLOCK4);
+    uint32_t rc = VARIANT_MCK/128/frequency; //128 because we selected TIMER_CLOCK4 above
+    TC_SetRA(tc, channel, rc/2); //50% high, 50% low
+    TC_SetRC(tc, channel, rc);
+    TC_Start(tc, channel);
+    tc->TC_CHANNEL[channel].TC_IER=TC_IER_CPCS;
+    tc->TC_CHANNEL[channel].TC_IDR=~TC_IER_CPCS;
+    NVIC_EnableIRQ(irq);
+}
+void setup() {
+    Serial.begin(iBaudRate);
+    delay(10);
+
+    // Pin configuration
+    PIOC->PIO_PER = 0x01FE; // Configure PORTC for PIO control
+    PIOC->PIO_OER = 0x01FE; // Set PORTC pins as outputs
+    PIOD->PIO_PER = 0x01FF; // Configure PORTD for PIO control
+    PIOD->PIO_OER = 0xFFFF; // Set PORTD pins as outputs
+    pinMode(EN1, OUTPUT);
+    pinMode(PinG, OUTPUT);
+    pinMode(SEROP, OUTPUT);
+    analogReadResolution(12);
+    pinMode(interruptPin, INPUT_PULLUP);
+    
+    // Initial pin state and interrupt setup
+    PIOC->PIO_ODSR = ((DelayByt1) * 2);
+    digitalWrite(EN1, HIGH);
+    digitalWrite(EN1, LOW);
+    attachInterrupt(digitalPinToInterrupt(interruptPin), calibISR, RISING);
+    startTimer(TC1, 0, TC3_IRQn, 100);
+}
+
+// --- Main Program Loop ---
+void loop() {
+    GetCommand();
+
+    // Check if calibration is still in progress
+    if (!calibrationComplete) {
+      if (fullWaveReady) {
+          int localSignal[MAX_COUNT];
+          noInterrupts();
+          for (int k = 0; k < MAX_COUNT; ++k) localSignal[k] = signalBuffer[k];
+          fullWaveReady = false;
+          interrupts();
+
+          findPeaks(localSignal);
+          displayPeaks();
+          finalizeCalibrationWave();
+      }
+    }
+}
+
+// --- Interrupt Service Routine (for Calibration) ---
+void calibISR() {
+    lastSampleIndex = i;
+    sampleRequest = true;
+    if (sampleRequest) {
+        noInterrupts();
+        uint16_t idx = lastSampleIndex;
+        sampleRequest = false;
+        interrupts();
+        delayMicroseconds(6);
+        int val1 = analogRead(4);
+        int val2 = analogRead(4);
+        int val3 = analogRead(4);
+        int val4 = analogRead(4);
+        signalBuffer[idx] =(val1+val2+val3+val4)/4;
+
+        digitalWrite(PinG, HIGH);
+        delayMicroseconds(5);
+        digitalWrite(PinG, LOW);
+        
+        PIOC->PIO_ODSR = ((uint32_t)idx * 2);
+        
+        digitalWrite(EN1, HIGH);
+        delayMicroseconds(5);
+        digitalWrite(EN1, LOW);
+    }
+    if (++i >= MAX_COUNT) {
+        i = 0;
+        fullWaveReady = true;
+    }
+}
+
+
+// --- Peak Finding Function (Modified) ---
+void findPeaks(const int data[MAX_COUNT]) {
+  peakCount = 0;
+  const int THRESHOLD = 240;
+  const int MIN_PEAK_WIDTH = 15;
+
+  int countAboveThreshold = 0;
+  int peakStartIndex = -1;
+
+  // This variable will store the count of times the signal went above the threshold
+  int totalAboveThresholdEvents = 0;
+  // This array will store the continuous lengths of each above-threshold event
+  int continuousLengths[MAX_COUNT] = {0};
+  int eventIndex = 0;
+
+  for (int k = 0; k < MAX_COUNT; ++k) {
+    if (data[k] > THRESHOLD) {
+      if (countAboveThreshold == 0) {
+        // Start of a new above-threshold event
+        peakStartIndex = k;
+        totalAboveThresholdEvents++;
+      }
+      countAboveThreshold++;
+    } else {
+      // The signal dropped below the threshold
+      if (countAboveThreshold > 0) {
+        // End of an above-threshold event
+        continuousLengths[eventIndex++] = countAboveThreshold;
+
+        if (countAboveThreshold >= MIN_PEAK_WIDTH) {
+          // A peak is detected if the continuous count is large enough
+          int peakIndex = peakStartIndex + (countAboveThreshold / 2); // Center of the continuous stretch
+          int peakValue = data[peakIndex];
+
+          peakIndices[peakCount] = peakIndex;
+          peakValues[peakCount] = peakValue;
+          peakCount++;
+        }
+        // Reset the counter for the next event
+        countAboveThreshold = 0;
+        peakStartIndex = -1;
+      }
+    }
+  }
+
+  // Handle the case where the signal ends above the threshold
+  if (countAboveThreshold >= MIN_PEAK_WIDTH) {
+    int peakIndex = peakStartIndex + (countAboveThreshold / 2);
+    int peakValue = data[peakIndex];
+
+    peakIndices[peakCount] = peakIndex;
+    peakValues[peakCount] = peakValue;
+    peakCount++;
+  }
+}
+// --- Function to Display Peak Data ---
+void displayPeaks() {
+    Serial.println("\n--- Peak Analysis Results ---");
+    Serial.print("Total Peaks Found: ");
+    Serial.println(peakCount);
+    
+    if (peakCount > 0) {
+        Serial.println("-----------------------------");
+        Serial.println("Index\tValue");
+        Serial.println("-----------------------------");
+        for (int j = 0; j < peakCount; j++) {
+            Serial.print(peakIndices[j]);
+            Serial.print("\t");
+            Serial.println(peakValues[j]);
+        }
+        Serial.println("-----------------------------");
+    }
+}
+
+
+// --- Function to Analyze and Finalize a Single Calibration Wave ---
+void finalizeCalibrationWave() {
+    Serial.print("Wave ");
+    Serial.print(waveCounter + 1);
+    Serial.println(" peaks recorded.");
+    
+    // Store the peak count from the first wave
+    if (waveCounter == 0) {
+        finalPeakCount = peakCount;
+    }
+    
+    // Check for consistent peak count
+    if (peakCount != finalPeakCount) {
+        Serial.println("Error: Peak count is not consistent. Resetting calibration.");
+        waveCounter = 0; // Restart calibration
+        return;
+    }
+    
+    // Store the peak indices for the current wave
+    for (int k = 0; k < finalPeakCount; ++k) {
+        calibPeakIndices[waveCounter][k] = peakIndices[k];
+    }
+    
+    waveCounter++;
+
+    if (waveCounter >= NUM_CALIB_WAVES) {
+        Serial.println("\n--- Finalizing Calibration: All 8 waves captured. ---");
+        
+        // Calculate the average peak indices based on the actual number of peaks
+        for (int p = 0; p < finalPeakCount; ++p) {
+            long sum = 0;
+            for (int w = 0; w < NUM_CALIB_WAVES; ++w) {
+                sum += calibPeakIndices[w][p];
+            }
+            avgCalibPeaks[p] = round((float)sum / NUM_CALIB_WAVES);
+        }
+
+        applyAvgPeakDelays();
+        
+        calibrationComplete = true;
+        
+        // Detach calibration ISR and attach the new 'blink' ISR
+        detachInterrupt(digitalPinToInterrupt(interruptPin));
+        attachInterrupt(digitalPinToInterrupt(interruptPin), blink, RISING);
+        
+        Serial.println("Calibration complete. Operational interrupt attached.");
+    }
+}
+// --- Function to apply the averaged peak delays to the hardware ---
+void applyAvgPeakDelays() {
+  for (int i = 0; i < finalPeakCount; i++) {
+    if (avgCalibPeaks[i] == -1) continue;
+    PIOC->PIO_ODSR = avgCalibPeaks[i] * 2;
+    delayMicroseconds(5);
+    Serial.print("Avg Peak:");
+    Serial.println(avgCalibPeaks[i]);
+  }
+}
+
+
+void blink()
+{
+    // The main loop to iterate through the channels
+    for (int i = 0; i < finalPeakCount; i++) {
+        //  processing one channel per interrupt cycle
+        if (iChNo == i) {
+
+            // --- Delay Section ---
+            delayMicroseconds(6);
+            
+            // --- Analog Read and Accumulation Section ---
+            Ch[i] += analogRead(4);
+            delayMicroseconds(0.5);
+            Ch[i] += analogRead(4);
+            delayMicroseconds(0.5);
+            Ch[i] += analogRead(4);
+            delayMicroseconds(0.5);
+            Ch[i] += analogRead(4);
+            
+            // --- Delay Section ---
+            delayMicroseconds(6);
+            
+            // --- Pin Manipulation Section ---
+            digitalWrite(PinG, HIGH);
+            delayMicroseconds(20);
+            digitalWrite(PinG, LOW);
+            
+            // --- PIOC Register Update Section ---
+            if (i != finalPeakCount-1)
+              PIOC->PIO_ODSR = ((avgCalibPeaks[i+1]) * 2);
+            else
+              PIOC->PIO_ODSR = ((avgCalibPeaks[0]) * 2);
+            
+            // --- Pin Manipulation Section ---
+            digitalWrite(EN1, HIGH);
+            digitalWrite(EN1, LOW);
+            
+            // --- Averaging and Reset Section ---
+            iCountNo++;
+            if (iCountNo ==  (finalPeakCount*4)+1+ i) { 
+                AvgCh[i] = Ch[i] / (20);
+                Ch[i] = 0;
+                if (i == finalPeakCount - 1) {
+                    iCountNo = 0;
+                }
+            }
+            break; // Exit the for loop after processing one channel
+        }
+    }
+
+
+    iChNo++;
+    if (iChNo >= finalPeakCount) {
+        iChNo = 0;
+    }
+}
+void GetCommand() {
+    if (Serial.available() > 0) {
+        iReadStatus = Serial.readBytes(&bComChar, 1);
+        Serial.flush();
+        switch (bComChar) {
+            case cLinkCom:
+                delay(lKillTime);
+                Serial.println(getCommandResponse(cLinkCom));
+                bIsLinked = true;
+                bIsInAcqMode = false;
+                break;
+            case cAcqCom:
+                Serial.println(getCommandResponse(cAcqCom));
+                bIsInAcqMode = true;
+                delay(lKillTime);
+                break;
+            case cStopCom:
+                Serial.println(getCommandResponse(cStopCom));
+                bIsInAcqMode = false;
+                delay(lKillTime);
+                break;
+        }
+    }
+}
